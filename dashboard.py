@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 # === CONFIGURATION ===
 DATA_DIR = "data"
 PROCESSED_DATA_DIR = os.path.join(DATA_DIR, "processed")
+SECTOR_FILE = os.path.join(DATA_DIR, "Sector_Mapping_Cleaned.csv")
 
 # === UTILITY FUNCTIONS ===
 @st.cache_data
@@ -19,11 +20,7 @@ def load_all_stock_data():
         return pd.DataFrame()
 
     for file in os.listdir(PROCESSED_DATA_DIR):
-        if (
-            file.endswith(".csv")
-            and not file.startswith("top_")
-            and not file.startswith("sector_")
-        ):
+        if file.endswith(".csv") and not file.startswith("top_") and not file.startswith("sector_"):
             file_path = os.path.join(PROCESSED_DATA_DIR, file)
             try:
                 df = pd.read_csv(file_path)
@@ -31,12 +28,10 @@ def load_all_stock_data():
                 st.warning(f"Could not read {file}: {e}")
                 continue
 
-            # require columns
             if {"date", "symbol", "close"}.issubset(df.columns):
                 df["date"] = pd.to_datetime(df["date"])
                 if "volume" not in df.columns:
                     df["volume"] = np.nan
-                # normalize symbol strings and remove common suffixes
                 df["symbol"] = (
                     df["symbol"]
                     .astype(str)
@@ -52,7 +47,6 @@ def load_all_stock_data():
     return pd.concat(stock_data, ignore_index=True) if stock_data else pd.DataFrame()
 
 def calculate_daily_return(df):
-    """Calculate daily returns per symbol safely."""
     if df.empty:
         return df
     df = df.sort_values(["symbol", "date"]).copy()
@@ -60,18 +54,36 @@ def calculate_daily_return(df):
     return df
 
 # === MAIN APP ===
-st.set_page_config(page_title=" Stock Dashboard", layout="wide")
+st.set_page_config(page_title="Stock Dashboard", layout="wide")
 st.title("Data-Driven Stock Analysis Dashboard")
 
-# Load data
+# Load stock data
 df = load_all_stock_data()
 
 if df.empty:
     st.warning("No stock files found in data/processed/. Place CSVs there and try again.")
     st.stop()
 
+# Load sector mapping
+if os.path.exists(SECTOR_FILE):
+    sector_df = pd.read_csv(SECTOR_FILE)
+    sector_df.columns = sector_df.columns.str.lower().str.strip()  # normalize column names
+
+    if "ticker" in sector_df.columns and "sector" in sector_df.columns:
+        sector_df = sector_df.rename(columns={"ticker": "symbol"})[["symbol", "sector"]]
+        sector_df["symbol"] = sector_df["symbol"].astype(str).str.upper().str.strip()
+    elif "symbol" in sector_df.columns and "sector" in sector_df.columns:
+        sector_df = sector_df[["symbol", "sector"]]
+        sector_df["symbol"] = sector_df["symbol"].astype(str).str.upper().str.strip()
+    else:
+        st.warning("⚠️ Sector mapping file must contain 'Ticker' (or 'symbol') and 'Sector' columns.")
+        sector_df = pd.DataFrame()
+else:
+    st.warning("⚠️ Sector mapping file not found. Sector-wise performance will be skipped.")
+    sector_df = pd.DataFrame()
+
 # Sidebar filters
-st.sidebar.header(" Filter Options")
+st.sidebar.header("Filter Options")
 symbols = sorted(df["symbol"].astype(str).unique().tolist())
 selected_symbols = st.sidebar.multiselect("Select stocks:", options=symbols, default=symbols[:5])
 
@@ -91,15 +103,15 @@ else:
 # Filter dataframe
 filtered_df = df[(df["symbol"].isin(selected_symbols)) & (df["date"] >= start_dt) & (df["date"] <= end_dt)].copy()
 if filtered_df.empty:
-    st.warning(" No stock data matches your filter criteria (symbol/date). Adjust filters and try again.")
+    st.warning("No stock data matches your filter criteria (symbol/date). Adjust filters and try again.")
     st.stop()
 
 # Tabs
-tab1, tab2, tab3 = st.tabs([" Overview", "Visualizations", " Data View"])
+tab1, tab2, tab3 = st.tabs(["Overview", "Visualizations", "Data View"])
 
 # ---------------------- TAB 1: OVERVIEW ----------------------
 with tab1:
-    st.subheader(" Top 10 Gainers & Losers (Annual Return) — Full Dataset")
+    st.subheader("Top 10 Gainers & Losers (Annual Return) — Full Dataset")
 
     full_returns = calculate_daily_return(df.copy())
     annual_returns_full = full_returns.groupby("symbol")["daily_return"].mean().dropna() * 252 * 100
@@ -107,6 +119,13 @@ with tab1:
     if annual_returns_full.empty:
         st.info("Not enough data in the full dataset to compute annual returns.")
     else:
+        best_symbol = annual_returns_full.idxmax()
+        worst_symbol = annual_returns_full.idxmin()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Stocks", len(annual_returns_full))
+        c2.metric("Best Performer", best_symbol, f"{annual_returns_full.max():.2f}%")
+        c3.metric("Worst Performer", worst_symbol, f"{annual_returns_full.min():.2f}%")
+
         top_gainers = annual_returns_full.sort_values(ascending=False).head(10)
         top_losers = annual_returns_full.sort_values().head(10)
 
@@ -133,8 +152,7 @@ with tab1:
             )
             st.plotly_chart(fig_l, use_container_width=True)
 
-    # Market summary (filtered)
-    st.subheader(" Market Summary (Filtered)")
+    st.subheader("Market Summary (Filtered)")
     unique_dates = filtered_df["date"].drop_duplicates().sort_values()
     latest_date = unique_dates.iloc[-1]
     prev_date = unique_dates.iloc[-2] if len(unique_dates) >= 2 else latest_date
@@ -164,9 +182,13 @@ with tab1:
         c3.metric("Avg Price", f"{avg_price:.2f}")
         c4.metric("Avg Volume", f"{avg_volume:.0f}" if not np.isnan(avg_volume) else "N/A")
 
+        # Pie chart for Green vs Red
+        fig_pie = px.pie(values=[green, red], names=["Green", "Red"], title="Green vs Red Stock Count")
+        st.plotly_chart(fig_pie, use_container_width=True)
+
 # ---------------------- TAB 2: VISUALIZATIONS ----------------------
 with tab2:
-    st.subheader(" Volatility Analysis (Top 10) — Filtered")
+    st.subheader("Volatility Analysis (Top 10) — Filtered")
     returns_filtered = calculate_daily_return(filtered_df.copy())
     volatility = returns_filtered.groupby("symbol")["daily_return"].std().dropna().sort_values(ascending=False).head(10)
 
@@ -183,7 +205,7 @@ with tab2:
         )
         st.plotly_chart(fig_v, use_container_width=True)
 
-    st.subheader(" Cumulative Returns (Top 5 Performing — Overall)")
+    st.subheader("Cumulative Returns (Top 5 Performing — Overall)")
     if not annual_returns_full.empty:
         top5 = annual_returns_full.sort_values(ascending=False).head(5).index.tolist()
     else:
@@ -204,7 +226,7 @@ with tab2:
     else:
         st.line_chart(cum_df.sort_index())
 
-    st.subheader(" Stock Price Correlation Heatmap (Filtered)")
+    st.subheader("Stock Price Correlation Heatmap (Filtered)")
     pivot_df = filtered_df.pivot_table(index="date", columns="symbol", values="close", aggfunc="last").sort_index()
 
     if pivot_df.shape[1] < 2:
@@ -219,7 +241,28 @@ with tab2:
             sns.heatmap(corr.fillna(0), annot=True, fmt=".2f", cmap="coolwarm", ax=ax2)
             st.pyplot(fig2)
 
-    st.subheader(" Monthly Gainers & Losers (Filtered)")
+    # Sector-wise Performance
+    if not sector_df.empty and not annual_returns_full.empty:
+        st.subheader("Sector-wise Performance (Average Annual Return)")
+        annual_df = annual_returns_full.reset_index()
+        annual_df.columns = ["symbol", "annual_return"]
+
+        sector_map = pd.merge(annual_df, sector_df, on="symbol", how="inner")
+
+        if sector_map.empty:
+            st.info("No matching symbols found between stock data and sector mapping.")
+        else:
+            sector_summary = sector_map.groupby("sector")["annual_return"].mean().sort_values()
+            fig_sec = px.bar(
+                sector_summary,
+                x=sector_summary.index,
+                y=sector_summary.values,
+                labels={"x": "Sector", "y": "Avg Annual Return (%)"},
+                title="Average Annual Return by Sector",
+            )
+            st.plotly_chart(fig_sec, use_container_width=True)
+
+    st.subheader("Monthly Gainers & Losers (Filtered)")
     monthly_returns = calculate_daily_return(filtered_df.copy())
     monthly_returns["month"] = monthly_returns["date"].dt.to_period("M")
     monthly_summary = monthly_returns.groupby(["month", "symbol"])["daily_return"].mean().reset_index()
@@ -227,13 +270,15 @@ with tab2:
     if monthly_summary.empty:
         st.info("No monthly summary could be computed for this selection.")
     else:
-        latest_month = monthly_summary["month"].max()
-        latest_month_df = monthly_summary[monthly_summary["month"] == latest_month]
-        if latest_month_df.empty:
-            st.info("No data for the latest month in the selected range.")
+        months_available = sorted(monthly_summary["month"].unique())
+        selected_month = st.selectbox("Select month to view:", months_available, index=len(months_available)-1)
+        month_df = monthly_summary[monthly_summary["month"] == selected_month]
+
+        if month_df.empty:
+            st.info("No data for selected month.")
         else:
-            top_5_monthly = latest_month_df.sort_values(by="daily_return", ascending=False).head(5)
-            bottom_5_monthly = latest_month_df.sort_values(by="daily_return", ascending=True).head(5)
+            top_5_monthly = month_df.sort_values(by="daily_return", ascending=False).head(5)
+            bottom_5_monthly = month_df.sort_values(by="daily_return", ascending=True).head(5)
 
             col7, col8 = st.columns(2)
             with col7:
@@ -243,7 +288,7 @@ with tab2:
                     y="symbol",
                     orientation="h",
                     labels={"daily_return": "Avg Daily Return", "symbol": "Symbol"},
-                    title=f"Top 5 in {latest_month}",
+                    title=f"Top 5 in {selected_month}",
                 )
                 st.plotly_chart(fig_topm, use_container_width=True)
             with col8:
@@ -253,16 +298,18 @@ with tab2:
                     y="symbol",
                     orientation="h",
                     labels={"daily_return": "Avg Daily Return", "symbol": "Symbol"},
-                    title=f"Bottom 5 in {latest_month}",
+                    title=f"Bottom 5 in {selected_month}",
                 )
                 st.plotly_chart(fig_botm, use_container_width=True)
 
 # ---------------------- TAB 3: DATA VIEW ----------------------
 with tab3:
-    st.subheader(" Filtered Stock Data")
+    st.subheader("Filtered Stock Data")
     st.dataframe(filtered_df.sort_values(["symbol", "date"]).reset_index(drop=True), use_container_width=True)
 
     csv = filtered_df.to_csv(index=False).encode("utf-8")
-    st.download_button(" Download CSV", csv, "filtered_stocks.csv", "text/csv")
+    st.download_button("Download CSV", csv, "filtered_stocks.csv", "text/csv")
 
 st.caption("Built with Python, Pandas, Plotly, and Streamlit.")
+
+
